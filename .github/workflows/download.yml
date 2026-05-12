@@ -28,11 +28,11 @@ jobs:
           URL="${{ github.event.inputs.url }}"
           FILENAME="${{ github.event.inputs.filename }}"
           
-          # If no filename given, try to extract from URL
+          # If no filename given, extract from URL
           if [ "$FILENAME" = "downloaded_file" ]; then
-            BASENAME=$(basename "$URL" | cut -d'?' -f1)
-            if [ -n "$BASENAME" ]; then
-              FILENAME="$BASENAME"
+            EXTRACTED=$(basename "$URL" | cut -d'?' -f1)
+            if [ -n "$EXTRACTED" ]; then
+              FILENAME="$EXTRACTED"
             fi
           fi
           
@@ -40,29 +40,77 @@ jobs:
           curl -L --retry 3 -o "$FILENAME" "$URL"
           echo "FILENAME=$FILENAME" >> $GITHUB_ENV
 
-      - name: Split large file if needed
+      - name: Prepare download folder
         run: |
           FILENAME="${{ env.FILENAME }}"
-          MAX_SIZE=94371840   # 90 * 1024 * 1024 = 94,371,840 bytes
+          # Folder name: safe version of the filename (no spaces/special chars)
+          SAFE_DIR=$(echo "$FILENAME" | tr -c 'a-zA-Z0-9._-' '_')
+          DEST_DIR="downloads/$SAFE_DIR"
+          mkdir -p "$DEST_DIR"
+          echo "DEST_DIR=$DEST_DIR" >> $GITHUB_ENV
+
+      - name: Split into numbered parts
+        run: |
+          FILENAME="${{ env.FILENAME }}"
+          DEST_DIR="${{ env.DEST_DIR }}"
+          MAX_SIZE=94371840   # 90 MB
           
-          mkdir -p chunks
           SIZE=$(stat -c%s "$FILENAME")
           echo "File size: $SIZE bytes"
           
-          if [ "$SIZE" -gt "$MAX_SIZE" ]; then
-            echo "File exceeds 90 MB, splitting into chunks..."
-            split -b "$MAX_SIZE" "$FILENAME" chunks/"${FILENAME}.part"
-            # Remove the original large file so it isn’t committed
-            rm "$FILENAME"
-          else
-            echo "File is <= 90 MB, storing directly."
-            mv "$FILENAME" chunks/
+          if [ "$SIZE" -le "$MAX_SIZE" ]; then
+            # Just move the file directly
+            mv "$FILENAME" "$DEST_DIR/"
+            echo "File is small enough, stored directly."
+            exit 0
           fi
+          
+          # --- Large file: split into numbered parts ---
+          
+          # Detect if the file is a .zip to use multi-part ZIP naming
+          EXT="${FILENAME##*.}"
+          LOWERCASE_EXT=$(echo "$EXT" | tr '[:upper:]' '[:lower:]')
+          
+          if [ "$LOWERCASE_EXT" = "zip" ]; then
+            # Multi-part ZIP naming: .z01, .z02, ..., .zip (last part is .zip)
+            PREFIX="${FILENAME%.*}"   # name without extension
+            split -b "$MAX_SIZE" -d --additional-suffix=".zip_tmp" "$FILENAME" "${DEST_DIR}/${PREFIX}_part"
+            
+            # Rename parts: first ones become .z01, .z02... last one becomes .zip
+            PARTS=($(ls -1 "${DEST_DIR}/${PREFIX}_part"* | sort))
+            TOTAL=${#PARTS[@]}
+            COUNT=1
+            for PART in "${PARTS[@]}"; do
+              if [ $COUNT -lt $TOTAL ]; then
+                # intermediate parts: .z01, .z02, ...
+                NUM=$(printf "%02d" $COUNT)
+                mv "$PART" "${DEST_DIR}/${PREFIX}.z${NUM}"
+              else
+                # last part: .zip
+                mv "$PART" "${DEST_DIR}/${PREFIX}.zip"
+              fi
+              COUNT=$((COUNT + 1))
+            done
+            
+          else
+            # Generic numbering: filename.part001, filename.part002 ...
+            split -b "$MAX_SIZE" -d --additional-suffix=".partchunk" "$FILENAME" "${DEST_DIR}/${FILENAME}_chunk"
+            PARTS=($(ls -1 "${DEST_DIR}/${FILENAME}_chunk"* | sort))
+            COUNT=1
+            for PART in "${PARTS[@]}"; do
+              NUM=$(printf "%03d" $COUNT)
+              mv "$PART" "${DEST_DIR}/${FILENAME}.part${NUM}"
+              COUNT=$((COUNT + 1))
+            done
+          fi
+          
+          # Remove the original large file
+          rm "$FILENAME"
 
-      - name: Commit and push chunks
+      - name: Commit and push
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add chunks/
-          git commit -m "Add/download chunks of ${{ env.FILENAME }}" || echo "Nothing to commit"
+          git add downloads/
+          git commit -m "Download: ${{ env.FILENAME }} (chunked)" || echo "Nothing to commit"
           git push
