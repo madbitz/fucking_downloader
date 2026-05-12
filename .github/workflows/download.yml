@@ -1,0 +1,68 @@
+name: Download and chunk file
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'URL of the file to download'
+        required: true
+        type: string
+      filename:
+        description: 'File name to save as (optional)'
+        required: false
+        type: string
+        default: 'downloaded_file'
+
+jobs:
+  download-and-split:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download file
+        run: |
+          URL="${{ github.event.inputs.url }}"
+          FILENAME="${{ github.event.inputs.filename }}"
+          
+          # If no filename given, try to extract from URL
+          if [ "$FILENAME" = "downloaded_file" ]; then
+            BASENAME=$(basename "$URL" | cut -d'?' -f1)
+            if [ -n "$BASENAME" ]; then
+              FILENAME="$BASENAME"
+            fi
+          fi
+          
+          echo "Downloading $URL as $FILENAME"
+          curl -L --retry 3 -o "$FILENAME" "$URL"
+          echo "FILENAME=$FILENAME" >> $GITHUB_ENV
+
+      - name: Split large file if needed
+        run: |
+          FILENAME="${{ env.FILENAME }}"
+          MAX_SIZE=94371840   # 90 * 1024 * 1024 = 94,371,840 bytes
+          
+          mkdir -p chunks
+          SIZE=$(stat -c%s "$FILENAME")
+          echo "File size: $SIZE bytes"
+          
+          if [ "$SIZE" -gt "$MAX_SIZE" ]; then
+            echo "File exceeds 90 MB, splitting into chunks..."
+            split -b "$MAX_SIZE" "$FILENAME" chunks/"${FILENAME}.part"
+            # Remove the original large file so it isn’t committed
+            rm "$FILENAME"
+          else
+            echo "File is <= 90 MB, storing directly."
+            mv "$FILENAME" chunks/
+          fi
+
+      - name: Commit and push chunks
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add chunks/
+          git commit -m "Add/download chunks of ${{ env.FILENAME }}" || echo "Nothing to commit"
+          git push
